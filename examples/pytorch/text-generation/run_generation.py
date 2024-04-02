@@ -31,6 +31,8 @@ from transformers import (
     AutoTokenizer,
     BloomForCausalLM,
     BloomTokenizerFast,
+    CohereForCausalLM,
+    CohereTokenizerFast,
     CTRLLMHeadModel,
     CTRLTokenizer,
     GenerationMixin,
@@ -62,6 +64,7 @@ logger = logging.getLogger(__name__)
 MAX_LENGTH = int(10000)  # Hardcoded max length to avoid infinite loop
 
 MODEL_CLASSES = {
+    "cohere": (CohereForCausalLM, CohereTokenizerFast),
     "gpt2": (GPT2LMHeadModel, GPT2Tokenizer),
     "ctrl": (CTRLLMHeadModel, CTRLTokenizer),
     "openai-gpt": (OpenAIGPTLMHeadModel, OpenAIGPTTokenizer),
@@ -355,11 +358,12 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
     model = model_class.from_pretrained(args.model_name_or_path)
 
+    if args.fp16:
+        model.half()
+
     # Set the model to the right device
     model.to(distributed_state.device)
 
-    if args.fp16:
-        model.half()
     max_seq_length = getattr(model.config, "max_position_embeddings", 0)
     args.length = adjust_length_to_model(args.length, max_sequence_length=max_seq_length)
     logger.info(args)
@@ -380,6 +384,9 @@ def main():
         encoded_prompt = tokenizer.encode(
             preprocessed_prompt_text, add_special_tokens=False, return_tensors="pt", **tokenizer_kwargs
         )
+    elif args.model_type == "cohere":
+        messages = [{"role": "user", "content": args.prompt}]
+        encoded_prompt = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_tensors="pt")
     else:
         prefix = args.prefix if args.prefix else args.padding_text
         encoded_prompt = tokenizer.encode(prefix + prompt_text, add_special_tokens=False, return_tensors="pt")
@@ -407,6 +414,7 @@ def main():
 
         model = _ModelFallbackWrapper(traced_model, model)
 
+    t0 = time.perf_counter()
     output_sequences = model.generate(
         input_ids=input_ids,
         max_length=args.length + len(encoded_prompt[0]),
@@ -417,6 +425,11 @@ def main():
         do_sample=True,
         num_return_sequences=args.num_return_sequences,
     )
+
+    duration = time.perf_counter() - t0
+    # TODO: Verify if this is equivalent to Gaudi
+    total_new_tokens_generated = args.num_return_sequences
+    throughput = total_new_tokens_generated / duration
 
     # Remove the batch dimension when returning multiple sequences
     if len(output_sequences.shape) > 2:
