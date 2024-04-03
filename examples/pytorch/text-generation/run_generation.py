@@ -21,6 +21,7 @@
 import argparse
 import inspect
 import logging
+import time
 from typing import Tuple
 
 import torch
@@ -101,7 +102,7 @@ def prepare_ctrl_input(args, _, tokenizer, prompt_text):
     if args.temperature > 0.7:
         logger.info("CTRL typically works better with lower temperatures (and lower top_k).")
 
-    encoded_prompt = tokenizer.encode(prompt_text, add_special_tokens=False)
+    oncoded_prompt = tokenizer.encode(prompt_text, add_special_tokens=False)
     if not any(encoded_prompt[0] == x for x in tokenizer.control_codes.values()):
         logger.info("WARNING! You are not starting your generation from a control code so you won't get good results")
     return prompt_text
@@ -336,6 +337,11 @@ def main():
         help="Whether to use 16-bit (mixed) precision (through NVIDIA apex) instead of 32-bit",
     )
     parser.add_argument("--jit", action="store_true", help="Whether or not to use jit trace to accelerate inference")
+    parser.add_argument("--batch_size", type=int, default=1, help="Input batch size.")
+    parser.add_argument("--warmup", type=int, default=3, help="Number of warmup iterations for benchmarking.")
+    parser.add_argument("--n_iterations", type=int, default=5, help="Number of inference iterations for benchmarking.")
+    parser.add_argument("--max_new_tokens", type=int, default=100, help="Number of tokens to generata.")
+
     args = parser.parse_args()
 
     # Initialize the distributed state.
@@ -370,71 +376,82 @@ def main():
 
     prompt_text = args.prompt if args.prompt else input("Model prompt >>> ")
 
-    # Different models need different input formatting and/or extra arguments
-    requires_preprocessing = args.model_type in PREPROCESSING_FUNCTIONS.keys()
-    if requires_preprocessing:
-        prepare_input = PREPROCESSING_FUNCTIONS.get(args.model_type)
-        preprocessed_prompt_text = prepare_input(args, model, tokenizer, prompt_text)
+    def generate(model):
 
-        if model.__class__.__name__ in ["TransfoXLLMHeadModel"]:
-            tokenizer_kwargs = {"add_space_before_punct_symbol": True}
+        # Different models need different input formatting and/or extra arguments
+        requires_preprocessing = args.model_type in PREPROCESSING_FUNCTIONS.keys()
+        if requires_preprocessing:
+            prepare_input = PREPROCESSING_FUNCTIONS.get(args.model_type)
+            preprocessed_prompt_text = prepare_input(args, model, tokenizer, prompt_text)
+
+            if model.__class__.__name__ in ["TransfoXLLMHeadModel"]:
+                tokenizer_kwargs = {"add_space_before_punct_symbol": True}
+            else:
+                tokenizer_kwargs = {}
+
+            encoded_prompt = tokenizer.encode(
+                preprocessed_prompt_text, add_special_tokens=False, return_tensors="pt", **tokenizer_kwargs
+            )
+        elif args.model_type == "cohere":
+            messages = [{"role": "user", "content": args.prompt}]
+            encoded_prompt = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_tensors="pt")
         else:
-            tokenizer_kwargs = {}
+            prefix = args.prefix if args.prefix else args.padding_text
+            encoded_prompt = tokenizer.encode(prefix + prompt_text, add_special_tokens=False, return_tensors="pt")
+        encoded_prompt = encoded_prompt.to(distributed_state.device)
 
-        encoded_prompt = tokenizer.encode(
-            preprocessed_prompt_text, add_special_tokens=False, return_tensors="pt", **tokenizer_kwargs
-        )
-    elif args.model_type == "cohere":
-        messages = [{"role": "user", "content": args.prompt}]
-        encoded_prompt = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_tensors="pt")
-    else:
-        prefix = args.prefix if args.prefix else args.padding_text
-        encoded_prompt = tokenizer.encode(prefix + prompt_text, add_special_tokens=False, return_tensors="pt")
-    encoded_prompt = encoded_prompt.to(distributed_state.device)
-
-    if encoded_prompt.size()[-1] == 0:
-        input_ids = None
-    else:
-        input_ids = encoded_prompt
-
-    if args.jit:
-        jit_input_texts = ["enable jit"]
-        jit_inputs = prepare_jit_inputs(jit_input_texts, model, tokenizer)
-        torch._C._jit_set_texpr_fuser_enabled(False)
-        model.config.return_dict = False
-        if hasattr(model, "forward"):
-            sig = inspect.signature(model.forward)
+        if encoded_prompt.size()[-1] == 0:
+            input_ids = None
         else:
-            sig = inspect.signature(model.__call__)
-        jit_inputs = tuple(jit_inputs[key] for key in sig.parameters if jit_inputs.get(key, None) is not None)
-        traced_model = torch.jit.trace(model, jit_inputs, strict=False)
-        traced_model = torch.jit.freeze(traced_model.eval())
-        traced_model(*jit_inputs)
-        traced_model(*jit_inputs)
+            input_ids = encoded_prompt
 
-        model = _ModelFallbackWrapper(traced_model, model)
+        if args.jit:
+            jit_input_texts = ["enable jit"]
+            jit_inputs = prepare_jit_inputs(jit_input_texts, model, tokenizer)
+            torch._C._jit_set_texpr_fuser_enabled(False)
+            model.config.return_dict = False
+            if hasattr(model, "forward"):
+                sig = inspect.signature(model.forward)
+            else:
+                sig = inspect.signature(model.__call__)
+            jit_inputs = tuple(jit_inputs[key] for key in sig.parameters if jit_inputs.get(key, None) is not None)
+            traced_model = torch.jit.trace(model, jit_inputs, strict=False)
+            traced_model = torch.jit.freeze(traced_model.eval())
+            traced_model(*jit_inputs)
+            traced_model(*jit_inputs)
 
+            model = _ModelFallbackWrapper(traced_model, model)
+
+
+        for i in range(args.n_iterations):
+            output_sequences = model.generate(
+                input_ids=input_ids,
+                max_length=args.length + len(encoded_prompt[0]),
+                temperature=args.temperature,
+                top_k=args.k,
+                top_p=args.p,
+                repetition_penalty=args.repetition_penalty,
+                do_sample=True,
+                num_return_sequences=args.num_return_sequences,
+            )
+
+
+        # Remove the batch dimension when returning multiple sequences
+        if len(output_sequences.shape) > 2:
+            output_sequences.squeeze_()
+
+        return encoded_prompt, output_sequences
+
+    if args.warmup:
+        print(f"Warming up for {args.warmup} iterations")
+        generate(model)
+ 
     t0 = time.perf_counter()
-    output_sequences = model.generate(
-        input_ids=input_ids,
-        max_length=args.length + len(encoded_prompt[0]),
-        temperature=args.temperature,
-        top_k=args.k,
-        top_p=args.p,
-        repetition_penalty=args.repetition_penalty,
-        do_sample=True,
-        num_return_sequences=args.num_return_sequences,
-    )
-
+    for i in range(args.n_iterations):
+        encoded_prompt, output_sequences = generate(model)
     duration = time.perf_counter() - t0
-    # TODO: Verify if this is equivalent to Gaudi
-    total_new_tokens_generated = args.num_return_sequences
+    total_new_tokens_generated = args.n_iterations * args.batch_size * args.max_new_tokens
     throughput = total_new_tokens_generated / duration
-
-    # Remove the batch dimension when returning multiple sequences
-    if len(output_sequences.shape) > 2:
-        output_sequences.squeeze_()
-
     generated_sequences = []
 
     for generated_sequence_idx, generated_sequence in enumerate(output_sequences):
@@ -444,6 +461,7 @@ def main():
         # Decode text
         text = tokenizer.decode(generated_sequence, clean_up_tokenization_spaces=True)
 
+        print(text)
         # Remove all text after the stop token
         text = text[: text.find(args.stop_token) if args.stop_token else None]
 
@@ -454,7 +472,13 @@ def main():
 
         generated_sequences.append(total_sequence)
         print(total_sequence)
-
+ 
+    stats = f"Throughput (including tokenization) = {throughput} tokens/second"
+    separator = "-" * len(stats)
+    print()
+    print("Stats:")
+    print(separator)
+    print(stats)
     return generated_sequences
 
 
